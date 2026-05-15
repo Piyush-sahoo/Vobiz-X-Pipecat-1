@@ -49,7 +49,9 @@ async def make_vobiz_call(
         raise ValueError("Missing Vobiz Auth Token (VOBIZ_AUTH_TOKEN)")
 
     print(f"[DEBUG] Auth ID: {auth_id}")
-    print(f"[DEBUG] Auth Token: {auth_token[:10]}...{auth_token[-10:]}")  # Partial token for security
+    # Log only the last 4 chars so we can tell tokens apart in logs without
+    # leaking ~50% of the secret. Drop the whole line if even that is too much.
+    print(f"[DEBUG] Auth Token: …{auth_token[-4:]}")
 
     headers = {
         "Content-Type": "application/json",
@@ -163,8 +165,16 @@ def get_websocket_url(host: str):
     env = os.getenv("ENV", "local").lower()
 
     if env == "production":
-        # For production, use Pipecat Cloud WebSocket URL (Plivo endpoint works for Vobiz)
-        return "wss://api.pipecat.daily.co/ws/plivo"
+        # Production WebSocket endpoint, configured via env var. Set this
+        # to the public wss:// URL where your bot is reachable (e.g. a
+        # Pipecat Cloud agent endpoint or your own deployment).
+        prod_ws_url = os.getenv("VOBIZ_PROD_WS_URL")
+        if not prod_ws_url:
+            raise ValueError(
+                "ENV=production but VOBIZ_PROD_WS_URL is not set. "
+                "Set it to the wss:// URL where your bot is hosted."
+            )
+        return prod_ws_url
     else:
         # Return WebSocket URL for local/ngrok deployment
         return f"wss://{host}/ws"
@@ -308,8 +318,13 @@ async def get_answer_xml(
         if call_info.get("transfer_requested"):
             print(f"[ANSWER] 🔄 Call {CallUUID} is marked for transfer - returning Dial XML")
 
-            # Get transfer destination
-            agent_number = os.getenv("TRANSFER_AGENT_NUMBER", "+919148227303")
+            # Get transfer destination from env. No hardcoded default — fail loud.
+            agent_number = os.getenv("TRANSFER_AGENT_NUMBER")
+            if not agent_number:
+                raise HTTPException(
+                    status_code=500,
+                    detail="TRANSFER_AGENT_NUMBER not configured in .env",
+                )
 
             # Return transfer XML with Dial element
             xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -405,10 +420,15 @@ async def get_answer_xml(
         
         final_ws_url = f"{ws_url_base}?{'&'.join(query_params)}" if query_params else ws_url_base
 
+        vobiz_encoding = os.getenv("VOBIZ_ENCODING", "audio/x-mulaw")
+        vobiz_rate = int(os.getenv("VOBIZ_SAMPLE_RATE", "8000"))
+        vobiz_content_type = f"{vobiz_encoding};rate={vobiz_rate}"
+        print(f"[INFO] Vobiz wire format: {vobiz_content_type}")
+
         xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
 {record_element}
-        <Stream bidirectional="true" audioTrack="inbound" contentType="audio/x-mulaw;rate=8000" keepCallAlive="true">
+        <Stream bidirectional="true" audioTrack="inbound" contentType="{vobiz_content_type}" keepCallAlive="true">
             {final_ws_url}
         </Stream>
 </Response>"""
@@ -534,8 +554,12 @@ async def transfer_to_human(request: Request) -> HTMLResponse:
     """Return XML to transfer call to a human agent"""
     print("\n[TRANSFER] ========== TRANSFER TO HUMAN ==========")
 
-    # Get transfer destination from query params or use default
-    agent_number = os.getenv("TRANSFER_AGENT_NUMBER", "+919148227303")
+    agent_number = os.getenv("TRANSFER_AGENT_NUMBER")
+    if not agent_number:
+        raise HTTPException(
+            status_code=500,
+            detail="TRANSFER_AGENT_NUMBER not configured in .env",
+        )
 
     print(f"[TRANSFER] Transferring call to human agent: {agent_number}")
 
@@ -545,7 +569,7 @@ async def transfer_to_human(request: Request) -> HTMLResponse:
     <Speak voice="WOMAN" language="en-US">
         Please hold while I transfer you to a human agent.
     </Speak>
-    <Dial>+919148227303</Dial>
+    <Dial>{agent_number}</Dial>
 </Response>"""
 
     print(f"[TRANSFER] Returning transfer XML")
@@ -712,25 +736,18 @@ async def handle_vobiz_websocket(
         # Import the bot function from the bot module
         from bot import bot
         from pipecat.runner.types import WebSocketRunnerArguments
-        from pipecat.runner.utils import parse_telephony_websocket
 
         print("[DEBUG] Starting bot initialization...")
 
-        print("[DEBUG] Starting bot initialization...")
-
-        # CRITICAL FIX: Do NOT parse the WebSocket here using parse_telephony_websocket(websocket)
-        # That would consume the initial handshake messages, leaving the socket "empty" for the Pipecat transport.
-        # Instead, we rely on the query parameters we put in the XML (call_uuid).
-        
-        # Get IDs from query params (preferred) or just generate/placeholder if missing
-        call_uuid = websocket.query_params.get("call_uuid")
-        if not call_uuid:
-             call_uuid = websocket.query_params.get("call_id")
-        
-        # Stream ID might come later in the protocol, but for Vobiz/Plivo it's often in the start message.
-        # Since we can't read the start message here without breaking Pipecat, we pass None
-        # and let bot.py's transport handle the protocol handshake naturally.
-        stream_id = None 
+        # Do NOT call parse_telephony_websocket(websocket) here — it consumes
+        # the initial handshake messages and leaves the socket "empty" for
+        # the Pipecat transport. bot.py uses parse_vobiz_start() instead,
+        # which captures the negotiated mediaFormat AND the stream/call IDs.
+        call_uuid = (
+            websocket.query_params.get("call_uuid")
+            or websocket.query_params.get("call_id")
+        )
+        stream_id = None
 
         if call_uuid:
             # Update or create entry in active_calls with WebSocket reference

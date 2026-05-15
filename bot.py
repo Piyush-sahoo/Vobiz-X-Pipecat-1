@@ -13,10 +13,12 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.runner.types import RunnerArguments
-from pipecat.runner.utils import parse_telephony_websocket
-from pipecat.serializers.vobiz import VobizFrameSerializer
+from pipecat.serializers.vobiz import VobizFrameSerializer, parse_vobiz_start
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.services.openai.tts import OpenAITTSService
@@ -52,7 +54,12 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
     ]
 
     context = LLMContext(messages)
-    context_aggregator = LLMContextAggregatorPair(context)
+    # pipecat 1.x: vad_analyzer lives on LLMUserAggregatorParams now,
+    # not on the transport (transport-side vad_analyzer is silently a no-op).
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+    )
 
     pipeline = Pipeline(
         [
@@ -84,6 +91,11 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Outbound call ended")
+        # task.cancel() is correct when the *caller* hangs up first — the
+        # WS is already dead so there is no in-flight TTS to drain. If your
+        # bot ends the call itself (e.g. graceful EndFrame from a flow),
+        # prefer `await task.stop_when_done()` so queued TTS frames finish
+        # playing before the pipeline tears down.
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=handle_sigint)
@@ -94,15 +106,20 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
 async def bot(runner_args: RunnerArguments, call_id: str = None, stream_id: str = None):
     """Main bot entry point compatible with Pipecat Cloud."""
 
-    # If call_id/stream_id not provided, try to parse from WebSocket (legacy behavior)
-    if not call_id or not stream_id:
-        # Parse the telephony WebSocket to extract stream_id and call_id
-        transport_type, call_data = await parse_telephony_websocket(runner_args.websocket)
-        logger.info(f"Transport type: {transport_type}, Call data: {call_data}")
-        stream_id = call_data.get("stream_id", "")
-        call_id = call_data.get("call_id", "")
-    else:
-        logger.info(f"Using pre-parsed call data - Call ID: {call_id}, Stream ID: {stream_id}")
+    # Read Vobiz's `start` event off the WebSocket to learn the negotiated
+    # wire format (encoding + sample rate + IDs). Env vars are fallback hints.
+    env_encoding = os.getenv("VOBIZ_ENCODING", "audio/x-mulaw")
+    env_sample_rate = int(os.getenv("VOBIZ_SAMPLE_RATE", "8000"))
+
+    parsed = await parse_vobiz_start(runner_args.websocket)
+    logger.info(
+        f"Vobiz start: callId={parsed['call_id']!r}, streamId={parsed['stream_id']!r}, "
+        f"mediaFormat=({parsed['encoding']!r}, {parsed['sample_rate']})"
+    )
+    call_id = call_id or parsed["call_id"]
+    stream_id = stream_id or parsed["stream_id"]
+    vobiz_encoding = parsed["encoding"] or env_encoding
+    vobiz_sample_rate = parsed["sample_rate"] or env_sample_rate
 
     serializer = VobizFrameSerializer(
         stream_id=stream_id,
@@ -110,11 +127,12 @@ async def bot(runner_args: RunnerArguments, call_id: str = None, stream_id: str 
         auth_id=os.getenv("VOBIZ_AUTH_ID", ""),
         auth_token=os.getenv("VOBIZ_AUTH_TOKEN", ""),
         params=VobizFrameSerializer.InputParams(
-            vobiz_sample_rate=8000,
-            encoding="audio/x-l16",  # Request L16 encoding
-            sample_rate=None,  # Uses pipeline default
-            auto_hang_up=True  # Automatically hangs up on EndFrame
-        )
+            vobiz_sample_rate=vobiz_sample_rate,
+            encoding=vobiz_encoding,
+            sample_rate=None,
+            l16_byte_order=os.getenv("VOBIZ_L16_ENDIAN", "be"),
+            auto_hang_up=True,
+        ),
     )
 
     transport = FastAPIWebsocketTransport(
@@ -123,8 +141,9 @@ async def bot(runner_args: RunnerArguments, call_id: str = None, stream_id: str 
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,  # CRITICAL: Must be False for telephony
-            serializer=serializer,  
-            vad_analyzer=SileroVADAnalyzer(),
+            serializer=serializer,
+            # NOTE: vad_analyzer is deprecated on FastAPIWebsocketParams in
+            # pipecat 1.x. VAD is now wired on LLMUserAggregatorParams above.
         ),
     )
 

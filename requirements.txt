@@ -1,8 +1,10 @@
-# Pipecat AI with required features
-pipecat-ai[websocket,openai,silero]>=0.0.86
+# Pipecat AI 1.x is required: VAD must be wired on LLMUserAggregatorParams
+# (the transport's `vad_analyzer` is a silent no-op in 1.x).
+pipecat-ai[websocket,openai,silero]>=1.2.0,<2
 
-# Vobiz telephony integration (from PyPI)
-pipecat-vobiz>=0.0.2
+# Vobiz telephony integration (from PyPI). 0.0.3 adds L16 + multi-rate +
+# start-event negotiation + stop-event hangup.
+pipecat-vobiz>=0.0.3,<0.1
 
 # Web framework
 fastapi
