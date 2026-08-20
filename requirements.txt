@@ -11,8 +11,9 @@ fastapi
 uvicorn
 python-multipart
 
-# HTTP client
+# HTTP clients
 aiohttp
+requests  # used by download_recording.py
 
 # Environment variables
 python-dotenv

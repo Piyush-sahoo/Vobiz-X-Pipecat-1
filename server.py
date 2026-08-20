@@ -396,29 +396,18 @@ async def get_answer_xml(
 
         # Build Record element if recording is enabled
         record_element = ""
-        # if enable_recording:
-        # User requested specific hardcoded XML structure
-        # record_action_url = f"{protocol}://{host}/recording-finished"
-        # record_callback_url = f"{protocol}://{host}/recording-ready"
-
-        record_element = f"""
-        <Record fileFormat="wav" maxLength="3600" recordSession="true" callbackUrl="{protocol}://{host}/recording-ready" callbackMethod="POST">
+        if enable_recording:
+            record_element = f"""
+        <Record fileFormat="wav" maxLength="{max_recording_length}" recordSession="true" callbackUrl="{protocol}://{host}/recording-ready" callbackMethod="POST">
         </Record>"""
+            print(f"[INFO] Recording enabled (maxLength={max_recording_length}s)")
+        else:
+            print(f"[INFO] Recording disabled (ENABLE_RECORDING=false)")
 
-        #     print(f"[INFO] Using user-requested hardcoded recording element")
-        # else:
-        #     print(f"[INFO] Recording disabled (ENABLE_RECORDING=false)")
-
-        # Use user-requested XML structure with specific params
-        # Note: We still need to inject the ws_url dynamic parameters if we want it to work with our bot
-        # But user asked for specific format. combining the two:
-        # Re-building correct WS URL to match user request pattern but with actual dynamic values where needed
-        ws_url_base = f"wss://{host}/voice/ws"
-        
-        # Use existing query_params populated earlier (lines 350-364)
-        # Note: query_params already contains serviceHost (if prod) and body (if present)
-        
-        final_ws_url = f"{ws_url_base}?{'&'.join(query_params)}" if query_params else ws_url_base
+        # ws_url was built above from get_websocket_url(host), which honours
+        # VOBIZ_PROD_WS_URL when ENV=production, and XML-escapes the query
+        # separator as &amp; so the <Stream> body stays well-formed XML.
+        final_ws_url = ws_url
 
         vobiz_encoding = os.getenv("VOBIZ_ENCODING", "audio/x-mulaw")
         vobiz_rate = int(os.getenv("VOBIZ_SAMPLE_RATE", "8000"))
