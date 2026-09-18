@@ -518,7 +518,12 @@ async def recording_ready(request: Request) -> HTMLResponse:
                 async with session.get(recording_url, headers=headers) as resp:
                     if resp.status == 200:
                         audio_data = await resp.read()
-                        filename = f"recordings/{recording_id}.mp3"
+                        # Use the extension Vobiz actually served. The
+                        # <Record> element picks the format (fileFormat="wav"
+                        # here), so hardcoding .mp3 produced RIFF/WAVE bytes
+                        # in a file named .mp3 that players reject.
+                        ext = os.path.splitext(urllib.parse.urlparse(recording_url).path)[1] or ".wav"
+                        filename = f"recordings/{recording_id}{ext}"
                         with open(filename, "wb") as f:
                             f.write(audio_data)
                         print(f"[RECORDING CALLBACK] ✅ Downloaded to {filename}")

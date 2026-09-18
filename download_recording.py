@@ -43,9 +43,11 @@ def download_recording(url: str, filename: str = None) -> str:
         parsed_url = urlparse(url)
         filename = Path(parsed_url.path).name
     
-    # Ensure .mp3 extension
-    if not filename.endswith('.mp3'):
-        filename += '.mp3'
+    # Keep the extension Vobiz actually served. The <Record> element
+    # chooses the format (fileFormat="wav" by default here), so forcing
+    # .mp3 produced files that were RIFF/WAVE bytes with an .mp3 name.
+    if not Path(filename).suffix:
+        filename += '.wav'
     
     output_path = OUTPUT_DIR / filename
     

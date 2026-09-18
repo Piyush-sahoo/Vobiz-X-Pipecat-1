@@ -1,9 +1,13 @@
-# Pipecat AI 1.x is required: VAD must be wired on LLMUserAggregatorParams
-# (the transport's `vad_analyzer` is a silent no-op in 1.x).
-pipecat-ai[websocket,openai,silero]>=1.2.0,<2
+# Pipecat AI 1.8.x. Requires Python >= 3.11.
+#
+# Extras map to the services bot.py uses:
+#   google    - Gemini LLM (cascaded) and Gemini Live (realtime)
+#   deepgram  - STT and TTS (cascaded)
+#   silero    - local VAD / turn detection
+#   websocket - the FastAPI WebSocket transport Vobiz streams into
+pipecat-ai[google,deepgram,silero,websocket]>=1.8.1,<1.9
 
-# Vobiz telephony integration (from PyPI). 0.0.3 adds L16 + multi-rate +
-# start-event negotiation + stop-event hangup.
+# Vobiz telephony: the <Stream> WebSocket protocol serializer.
 pipecat-vobiz>=0.0.3,<0.1
 
 # Web framework
@@ -13,7 +17,7 @@ python-multipart
 
 # HTTP clients
 aiohttp
-requests  # used by download_recording.py
+requests
 
 # Environment variables
 python-dotenv
