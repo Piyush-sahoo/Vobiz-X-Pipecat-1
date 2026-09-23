@@ -25,6 +25,7 @@ services:
     startCommand: python server.py
     healthCheckPath: /active-calls
     autoDeploy: true
+    branch: master
     envVars:
       # Secrets: set these in the Render dashboard or via the API. They are
       # deliberately NOT in this file, which is committed to a public repo.
