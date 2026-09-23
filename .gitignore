@@ -28,3 +28,4 @@ recordings/
 # OS
 .DS_Store
 Thumbs.db
+events.jsonl

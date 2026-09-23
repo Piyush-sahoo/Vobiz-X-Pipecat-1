@@ -1,0 +1,44 @@
+name: CI
+
+# Render redeploys on push by itself. This workflow is the gate in front of it:
+# it catches a broken import or malformed transfer XML before a bad commit
+# reaches the service that answers real phone calls.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Import the app
+        # Catches syntax errors and bad imports — the failure mode that would
+        # otherwise take the service down on deploy.
+        env:
+          VOBIZ_AUTH_ID: test
+          VOBIZ_AUTH_TOKEN: test
+        run: python -c "import server, bot, events, dashboard, ws_tap; print('imports OK')"
+
+      - name: Check transfer XML and SIP header rules
+        run: python -m unittest discover -s tests -v
+
+      - name: Fail if secrets or personal numbers were committed
+        run: |
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env is tracked — it must stay gitignored"; exit 1
+          fi
+          if git grep -nIE 'VOBIZ_AUTH_TOKEN[=:][[:space:]]*[A-Za-z0-9]{20,}' -- . ':!*.yml'; then
+            echo "::error::a literal auth token appears to be committed"; exit 1
+          fi

@@ -1,0 +1,68 @@
+# Render blueprint. Render watches the connected GitHub branch and redeploys on
+# every push, so this file plus the GitHub connection IS the CD half of CI/CD.
+#
+# Two settings here are not defaults and matter for a voice app:
+#
+#   numInstances: 1   active_calls is an in-process dict shared by /answer,
+#                     /start, the WebSocket and /initiate-transfer. A second
+#                     instance would serve /answer for a call whose WebSocket
+#                     lands on a different one, and Vobiz's WebSocket client
+#                     carries no session cookie to pin it. Raising this requires
+#                     moving that state to Redis first.
+#
+#   plan: starter     NOT free. Render's free tier spins down when idle, and a
+#                     cold start on the /answer webhook makes Vobiz time out
+#                     mid-call — the caller hears the phone answer and then the
+#                     call drops. A warm instance is the whole point.
+services:
+  - type: web
+    name: vobiz-pipecat
+    runtime: python
+    plan: starter
+    region: singapore          # closest Render region to an Indian DID
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /active-calls
+    autoDeploy: true
+    envVars:
+      # Secrets: set these in the Render dashboard or via the API. They are
+      # deliberately NOT in this file, which is committed to a public repo.
+      - key: VOBIZ_AUTH_TOKEN
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: VOBIZ_AUTH_ID
+        sync: false
+      - key: VOBIZ_PHONE_NUMBER
+        sync: false
+
+      # PUBLIC_URL must be this service's own https URL. Render exposes it as
+      # RENDER_EXTERNAL_URL, so the answer XML and the wss:// stream URL are
+      # built from the real host with nothing to update by hand.
+      - key: PUBLIC_URL
+        fromService:
+          type: web
+          name: vobiz-pipecat
+          envVarKey: RENDER_EXTERNAL_URL
+
+      - key: BOT_MODE
+        value: realtime
+      - key: ENV
+        value: local            # 'production' would return VOBIZ_PROD_WS_URL,
+                                # which is for a separately hosted bot; here the
+                                # bot shares this process.
+      - key: GEMINI_LIVE_MODEL
+        value: models/gemini-3.8-live
+      - key: GEMINI_VOICE
+        value: Charon
+      - key: VOBIZ_ENCODING
+        value: audio/x-mulaw
+      - key: VOBIZ_SAMPLE_RATE
+        value: "8000"
+      - key: ENABLE_RECORDING
+        value: "true"
+      - key: MAX_RECORDING_LENGTH
+        value: "3600"
+      - key: PYTHON_VERSION
+        value: "3.11.9"

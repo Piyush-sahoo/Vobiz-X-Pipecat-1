@@ -11,6 +11,7 @@ import json
 import os
 import urllib.parse
 from contextlib import asynccontextmanager
+from html import escape
 from datetime import datetime
 
 import aiohttp
@@ -18,7 +19,11 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+import events
+from dashboard import DASHBOARD_HTML
+from ws_tap import WebSocketTap
 
 load_dotenv(override=True)
 
@@ -33,8 +38,113 @@ active_calls = {}
 # ----------------- HELPERS ----------------- #
 
 
+async def _webhook_payload(request: Request) -> dict:
+    """Read a Vobiz webhook body regardless of how it was encoded.
+
+    Vobiz posts form-encoded data; query params carry the rest. Reading a body
+    must never raise here, or a malformed webhook would break call handling.
+    """
+    data = {}
+    try:
+        form = await request.form()
+        data.update({k: str(v) for k, v in form.items()})
+    except Exception:
+        pass
+    if not data:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                data.update(body)
+        except Exception:
+            pass
+    data.update({k: v for k, v in request.query_params.items() if k not in data})
+    return data
+
+
+def validate_sip_headers(raw: str):
+    """Check a `Key=value,Key2=value2` sipHeaders string against Vobiz's rules.
+
+    Returns (cleaned_string, [warnings]). Never raises and never drops pairs —
+    the caller decides what to do.
+
+    Keys must START with the `X-VH-` prefix: `X-VH-Ref=abc123`. A key without it
+    is rejected. Key stem and value must both be alphanumeric, so free text
+    cannot be carried — send an opaque id and look it up on the receiving side.
+
+    NOTE: VOBIZ_DOCS_CORRECTIONS.md 3.2 claims the reverse (that the key must
+    END with `X-VH` and `X-VH-` is only the arrival form). That document is
+    wrong on this point; the prefix form here is what Vobiz accepts.
+    """
+    warnings = []
+    pairs = []
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            warnings.append(f"'{chunk}' is not key=value — ignored")
+            continue
+        key, value = (p.strip() for p in chunk.split("=", 1))
+        if not key.upper().startswith("X-VH-"):
+            warnings.append(
+                f"key '{key}' does not start with 'X-VH-' — Vobiz rejects it"
+            )
+        stem = key[5:] if key.upper().startswith("X-VH-") else key
+        if not stem.isalnum():
+            warnings.append(f"key stem '{stem}' is not alphanumeric — punctuation is rejected")
+        if not value.isalnum():
+            warnings.append(
+                f"value '{value}' is not alphanumeric — free text cannot ride in a SIP "
+                "header; send an opaque id and look it up on the receiving side"
+            )
+        pairs.append(f"{key}={value}")
+    return ",".join(pairs), warnings
+
+
+def build_transfer_xml(dest_type: str, destination: str, host: str, protocol: str,
+                       sip_headers: str = None) -> str:
+    """Build the <Dial> document that bridges a live call to a human.
+
+    Two destination types, and the element inside <Dial> is what differs:
+
+      pstn -> <Number>+91...</Number>      a phone number
+      sip  -> <User>sip:x@domain</User>    a registered SIP endpoint
+
+    callbackUrl is not optional for the demo: per Vobiz's webhook sequence it is
+    the ONLY callback that reports the B-leg's identity and outcome. hangup_url
+    fires for the A-leg only, so without this the transferred leg is invisible.
+    Elements after </Dial> run only when the bridge does not happen, which makes
+    them the natural place for no-answer handling.
+    """
+    # sipHeaders is set on <Dial> (confirmed) and, for a SIP destination, also on
+    # <User> so it reaches the endpoint itself.
+    hdr_attr = f' sipHeaders="{escape(sip_headers, quote=True)}"' if sip_headers else ""
+
+    if dest_type == "sip":
+        target = destination if destination.startswith("sip:") else f"sip:{destination}"
+        inner = f"<User{hdr_attr}>{escape(target)}</User>"
+    else:
+        inner = f"<Number>{escape(destination)}</Number>"
+
+    caller_id = os.getenv("VOBIZ_PHONE_NUMBER", "")
+    caller_attr = f' callerId="{caller_id}"' if caller_id else ""
+
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Speak voice="WOMAN" language="en-US">Please hold while I transfer you.</Speak>
+    <Dial action="{protocol}://{host}/dial-complete" method="POST"
+          callbackUrl="{protocol}://{host}/dial-events" callbackMethod="POST"
+          timeout="30" timeLimit="3600"{caller_attr}{hdr_attr}>
+        {inner}
+    </Dial>
+    <Speak voice="WOMAN" language="en-US">The transfer could not be completed. Goodbye.</Speak>
+    <Hangup/>
+</Response>"""
+
+
 async def make_vobiz_call(
-    session: aiohttp.ClientSession, to_number: str, from_number: str, answer_url: str
+    session: aiohttp.ClientSession, to_number: str, from_number: str, answer_url: str,
+    hangup_url: str = None
 ):
     """Make an outbound call using Vobiz's REST API."""
     print("\n[DEBUG] ========== VOBIZ API CALL START ==========")
@@ -65,8 +175,16 @@ async def make_vobiz_call(
         "answer_url": answer_url,
         "answer_method": "POST",
     }
+    # Without hangup_url Vobiz never tells us the call ended, so the dashboard
+    # would show a call that starts and never finishes.
+    if hangup_url:
+        data["hangup_url"] = hangup_url
+        data["hangup_method"] = "POST"
 
     url = f"https://api.vobiz.ai/api/v1/Account/{auth_id}/Call/"
+
+    events.record("out", "POST /Call/ (make call)", {**data, "endpoint": url},
+                  kind="rest", note=f"dial {to_number} from {from_number}")
 
     print(f"[DEBUG] API URL: {url}")
     print(f"[DEBUG] Request Headers: {headers}")
@@ -86,6 +204,13 @@ async def make_vobiz_call(
                 raise Exception(f"Vobiz API error ({response.status}): {response_text}")
 
             result = json.loads(response_text)
+            # The Call API returns the id as `request_uuid`, which is the same
+            # value Vobiz later sends back as CallUUID. Without mapping it here
+            # the dashboard's UUID picker never learns the real call, so the
+            # transfer controls have nothing usable to target.
+            events.record("in", f"Vobiz REST response {response.status}", result,
+                          call_uuid=result.get("request_uuid"),
+                          kind="rest", note="call accepted")
             print(f"[SUCCESS] Vobiz API call successful!")
             print(f"[SUCCESS] Call UUID: {result.get('call_uuid', 'N/A')}")
             print("[DEBUG] ========== VOBIZ API CALL END ==========\n")
@@ -185,6 +310,12 @@ def get_websocket_url(host: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Replay any events captured before the last restart, so the dashboard is
+    # not blank after the process is restarted or killed.
+    restored = events.load_from_log()
+    if restored:
+        print(f"[EVENTS] restored {restored} events from {events.EVENT_LOG}")
+
     # Create aiohttp session for Vobiz API calls
     app.state.session = aiohttp.ClientSession()
     yield
@@ -256,6 +387,7 @@ async def initiate_outbound_call(request: Request) -> JSONResponse:
                 to_number=phone_number,
                 from_number=from_number,
                 answer_url=answer_url,
+                hangup_url=f"{protocol}://{host}/hangup",
             )
 
             # Extract call UUID from Vobiz response
@@ -304,6 +436,12 @@ async def get_answer_xml(
     print("\n[ANSWER] ========== ANSWER XML REQUEST ==========")
     print(f"[ANSWER] Call UUID: {CallUUID}")
 
+    # Vobiz POSTs the call envelope as form data. The endpoint only needs
+    # CallUUID to work, but the full payload is what makes the dashboard useful.
+    inbound = await _webhook_payload(request)
+    CallUUID = CallUUID or inbound.get("CallUUID")
+    events.record("in", "answer_url (StartApp)", inbound, call_uuid=CallUUID)
+
     # Parse body data from query parameter
     parsed_body_data = {}
     if body_data:
@@ -318,24 +456,28 @@ async def get_answer_xml(
         if call_info.get("transfer_requested"):
             print(f"[ANSWER] 🔄 Call {CallUUID} is marked for transfer - returning Dial XML")
 
-            # Get transfer destination from env. No hardcoded default — fail loud.
-            agent_number = os.getenv("TRANSFER_AGENT_NUMBER")
-            if not agent_number:
+            # Destination is whatever /initiate-transfer recorded for this call;
+            # env vars are only the fallback default.
+            dest_type = call_info.get("transfer_type") or os.getenv("TRANSFER_TYPE", "pstn")
+            destination = call_info.get("transfer_destination") or (
+                os.getenv("TRANSFER_SIP_ENDPOINT") if dest_type == "sip"
+                else os.getenv("TRANSFER_AGENT_NUMBER")
+            )
+            if not destination:
                 raise HTTPException(
                     status_code=500,
-                    detail="TRANSFER_AGENT_NUMBER not configured in .env",
+                    detail=f"No transfer destination for type '{dest_type}'. Set it in the "
+                           "request, or TRANSFER_AGENT_NUMBER / TRANSFER_SIP_ENDPOINT in .env",
                 )
 
-            # Return transfer XML with Dial element
-            xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Speak voice="WOMAN" language="en-US">
-        Please hold while I transfer you to a human agent.
-    </Speak>
-    <Dial>{agent_number}</Dial>
-</Response>"""
+            host, protocol = get_host_and_protocol(request)
+            xml_content = build_transfer_xml(
+                dest_type, destination, host, protocol,
+                call_info.get("transfer_sip_headers", ""))
+            events.record_xml(f"XML -> Vobiz: <Dial> transfer ({dest_type})",
+                              xml_content, call_uuid=CallUUID)
 
-            print(f"[ANSWER] Transferring to: {agent_number}")
+            print(f"[ANSWER] Transferring to: {destination} ({dest_type})")
             print(f"[ANSWER] Returning Dial XML")
             print("[ANSWER] ========== ANSWER XML END (TRANSFER) ==========\n")
 
@@ -422,6 +564,8 @@ async def get_answer_xml(
         </Stream>
 </Response>"""
 
+        events.record_xml("XML -> Vobiz: <Stream> + <Record>", xml_content,
+                          call_uuid=CallUUID)
         print(f"[DEBUG] XML Response:\n{xml_content}")
         print("[ANSWER] ========== ANSWER XML END (STREAM) ==========\n")
 
@@ -492,6 +636,10 @@ async def recording_ready(request: Request) -> HTMLResponse:
     recording_id = data.get("RecordingID")
     call_uuid = data.get("CallUUID")
 
+    events.record("in", "Record callbackUrl (RecordStop)",
+                  {k: str(v) for k, v in data.items()}, call_uuid=call_uuid,
+                  note="recording ready")
+
     print(f"[RECORDING CALLBACK] Recording file is ready for download!")
     print(f"[RECORDING CALLBACK] URL: {recording_url}")
     print(f"[RECORDING CALLBACK] Recording ID: {recording_id}")
@@ -548,25 +696,34 @@ async def transfer_to_human(request: Request) -> HTMLResponse:
     """Return XML to transfer call to a human agent"""
     print("\n[TRANSFER] ========== TRANSFER TO HUMAN ==========")
 
-    agent_number = os.getenv("TRANSFER_AGENT_NUMBER")
-    if not agent_number:
+    payload = await _webhook_payload(request)
+    call_uuid = payload.get("CallUUID")
+    events.record("in", "aleg_url (transfer redirect)", payload, call_uuid=call_uuid)
+
+    # Prefer what /initiate-transfer stored for this call; fall back to env.
+    call_info = active_calls.get(call_uuid, {})
+    dest_type = (request.query_params.get("type") or call_info.get("transfer_type")
+                 or os.getenv("TRANSFER_TYPE", "pstn"))
+    destination = (request.query_params.get("destination")
+                   or call_info.get("transfer_destination")
+                   or (os.getenv("TRANSFER_SIP_ENDPOINT") if dest_type == "sip"
+                       else os.getenv("TRANSFER_AGENT_NUMBER")))
+    if not destination:
         raise HTTPException(
             status_code=500,
-            detail="TRANSFER_AGENT_NUMBER not configured in .env",
+            detail=f"No transfer destination for type '{dest_type}'. Set it in the "
+                   "request, or TRANSFER_AGENT_NUMBER / TRANSFER_SIP_ENDPOINT in .env",
         )
 
-    print(f"[TRANSFER] Transferring call to human agent: {agent_number}")
+    sip_headers = (request.query_params.get("sip_headers")
+                   or call_info.get("transfer_sip_headers") or "")
 
-    # XML to transfer call to human
-    xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Speak voice="WOMAN" language="en-US">
-        Please hold while I transfer you to a human agent.
-    </Speak>
-    <Dial>{agent_number}</Dial>
-</Response>"""
+    host, protocol = get_host_and_protocol(request)
+    xml_content = build_transfer_xml(dest_type, destination, host, protocol, sip_headers)
+    events.record_xml(f"XML -> Vobiz: <Dial> transfer ({dest_type})",
+                      xml_content, call_uuid=call_uuid)
 
-    print(f"[TRANSFER] Returning transfer XML")
+    print(f"[TRANSFER] Transferring to {destination} ({dest_type})")
     print("[TRANSFER] ========== TRANSFER TO HUMAN END ==========\n")
 
     return HTMLResponse(content=xml_content, media_type="application/xml")
@@ -587,10 +744,44 @@ async def initiate_transfer(request: Request) -> JSONResponse:
     if call_uuid not in active_calls:
         raise HTTPException(status_code=404, detail=f"Call {call_uuid} not found in active calls")
 
+    # Destination type: "pstn" (a phone number) or "sip" (a registered endpoint).
+    dest_type = (data.get("type") or os.getenv("TRANSFER_TYPE", "pstn")).lower()
+    if dest_type not in ("pstn", "sip"):
+        raise HTTPException(status_code=400, detail="'type' must be 'pstn' or 'sip'")
+    destination = data.get("destination") or (
+        os.getenv("TRANSFER_SIP_ENDPOINT") if dest_type == "sip"
+        else os.getenv("TRANSFER_AGENT_NUMBER")
+    )
+    if not destination:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No destination for type '{dest_type}'. Pass 'destination', or set "
+                   "TRANSFER_AGENT_NUMBER / TRANSFER_SIP_ENDPOINT in .env",
+        )
+
+    # Which leg to redirect. aleg = the caller, bleg = the callee. Transferring
+    # one leg leaves the other running its current flow.
+    legs = (data.get("legs") or "aleg").lower()
+    if legs not in ("aleg", "bleg"):
+        raise HTTPException(status_code=400, detail="'legs' must be 'aleg' or 'bleg'")
+
+    sip_headers, header_warnings = validate_sip_headers(data.get("sip_headers", ""))
+    if header_warnings:
+        for w in header_warnings:
+            print(f"[TRANSFER] ⚠️  sipHeaders: {w}")
+
     call_info = active_calls[call_uuid]
 
-    # Mark call as transferring
+    # Mark call as transferring. /answer and /transfer-to-human both read these
+    # back when Vobiz re-fetches the document.
     call_info["status"] = "transferring"
+    call_info["transfer_requested"] = True
+    call_info["transfer_type"] = dest_type
+    call_info["transfer_destination"] = destination
+    call_info["transfer_sip_headers"] = sip_headers
+    print(f"[TRANSFER] Destination: {destination} ({dest_type}), legs={legs}")
+    if sip_headers:
+        print(f"[TRANSFER] sipHeaders: {sip_headers}")
     print(f"[TRANSFER] Marked call {call_uuid} as transferring")
 
     # Get Vobiz credentials
@@ -602,11 +793,13 @@ async def initiate_transfer(request: Request) -> JSONResponse:
     if not public_url:
         raise HTTPException(status_code=500, detail="PUBLIC_URL not configured in .env")
 
-    # Construct transfer URL
-    if public_url.startswith("http://") or public_url.startswith("https://"):
-        transfer_url = f"{public_url}/transfer-to-human"
-    else:
-        transfer_url = f"https://{public_url}/transfer-to-human"
+    # Construct transfer URL. The destination rides along as query params so the
+    # redirect is self-describing even if active_calls has been lost.
+    base = public_url if public_url.startswith("http") else f"https://{public_url}"
+    params = {"type": dest_type, "destination": destination}
+    if sip_headers:
+        params["sip_headers"] = sip_headers
+    transfer_url = f"{base}/transfer-to-human?{urllib.parse.urlencode(params)}"
 
     print(f"[TRANSFER] Call UUID: {call_uuid}")
     print(f"[TRANSFER] Transfer URL: {transfer_url}")
@@ -620,11 +813,12 @@ async def initiate_transfer(request: Request) -> JSONResponse:
         "Content-Type": "application/json"
     }
 
-    transfer_data = {
-        "legs": "aleg",  # Transfer the caller (A leg)
-        "aleg_url": transfer_url,
-        "aleg_method": "POST"
-    }
+    # Vobiz reads the url matching `legs`, so send only that one.
+    transfer_data = {"legs": legs, f"{legs}_url": transfer_url, f"{legs}_method": "POST"}
+
+    events.record("out", "POST /Call/{uuid}/ (transfer)",
+                  {**transfer_data, "endpoint": vobiz_url}, call_uuid=call_uuid,
+                  kind="rest", note=f"redirect A-leg -> {destination} ({dest_type})")
 
     print(f"[TRANSFER] Calling Vobiz Transfer API...")
     print(f"[TRANSFER] URL: {vobiz_url}")
@@ -640,6 +834,9 @@ async def initiate_transfer(request: Request) -> JSONResponse:
 
                 if resp.status == 202:  # 202 Accepted
                     result = json.loads(response_text)
+                    events.record("in", f"Vobiz REST response {resp.status}", result,
+                                  call_uuid=call_uuid, kind="rest",
+                                  note="transfer executed")
                     print(f"[TRANSFER] ✅ Transfer API call successful!")
                     print(f"[TRANSFER] Vobiz should now fetch XML from {transfer_url}")
                     print("[TRANSFER] ========== INITIATE TRANSFER END ==========\n")
@@ -647,6 +844,11 @@ async def initiate_transfer(request: Request) -> JSONResponse:
                     return JSONResponse({
                         "status": "transfer_initiated",
                         "call_uuid": call_uuid,
+                        "legs": legs,
+                        "type": dest_type,
+                        "destination": destination,
+                        "sip_headers": sip_headers,
+                        "sip_header_warnings": header_warnings,
                         "transfer_url": transfer_url,
                         "vobiz_response": result
                     })
@@ -664,6 +866,85 @@ async def initiate_transfer(request: Request) -> JSONResponse:
         print(f"[TRANSFER] Traceback:\n{traceback.format_exc()}")
         print("[TRANSFER] ========== INITIATE TRANSFER END (ERROR) ==========\n")
         raise HTTPException(status_code=500, detail=f"Transfer error: {str(e)}")
+
+
+@app.api_route("/hangup", methods=["GET", "POST"])
+async def hangup_webhook(request: Request) -> HTMLResponse:
+    """Vobiz hangup_url. Fires once per call, for the A-leg only."""
+    payload = await _webhook_payload(request)
+    call_uuid = payload.get("CallUUID")
+    events.record("in", "hangup_url (Hangup)", payload, call_uuid=call_uuid,
+                  note=payload.get("HangupCauseName"))
+    if call_uuid in active_calls:
+        active_calls[call_uuid]["status"] = "completed"
+    print(f"[HANGUP] {call_uuid} — {payload.get('HangupCauseName')}")
+    return HTMLResponse(content="", media_type="application/xml")
+
+
+@app.api_route("/dial-events", methods=["GET", "POST"])
+async def dial_events(request: Request) -> HTMLResponse:
+    """Dial callbackUrl — DialAnswer, DialConnected, DialHangup.
+
+    The only webhook that reports the transferred leg's identity and outcome:
+    hangup_url covers the A-leg only, so this is where the B-leg becomes visible.
+    """
+    payload = await _webhook_payload(request)
+    event_name = payload.get("Event") or payload.get("DialAction") or "DialEvent"
+    events.record("in", f"Dial callback ({event_name})", payload,
+                  call_uuid=payload.get("CallUUID"),
+                  note=f"B-leg {payload.get('DialBLegTo', '')} {payload.get('DialBLegStatus', '')}".strip())
+    print(f"[DIAL] {event_name} — B-leg {payload.get('DialBLegUUID')} "
+          f"{payload.get('DialBLegStatus')}")
+    return HTMLResponse(content="", media_type="application/xml")
+
+
+@app.api_route("/dial-complete", methods=["GET", "POST"])
+async def dial_complete(request: Request) -> HTMLResponse:
+    """Dial action — final result once the bridge ends."""
+    payload = await _webhook_payload(request)
+    events.record("in", "Dial action (final result)", payload,
+                  call_uuid=payload.get("CallUUID"),
+                  note=payload.get("DialStatus"))
+    print(f"[DIAL] complete — {payload.get('DialStatus')}")
+    return HTMLResponse(content="", media_type="application/xml")
+
+
+@app.get("/dashboard")
+async def dashboard() -> HTMLResponse:
+    """Live webhook inspector for the demo."""
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+
+@app.get("/events")
+async def events_stream(request: Request) -> StreamingResponse:
+    """Server-sent events: history, then live."""
+    return StreamingResponse(
+        events.sse_stream(request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/events/clear")
+async def events_clear(request: Request) -> JSONResponse:
+    """Clear the live feed. Pass {"wipe_log": true} to also delete the stored
+    record — otherwise clearing the screen keeps the history on disk."""
+    wipe = False
+    try:
+        wipe = bool((await request.json()).get("wipe_log"))
+    except Exception:
+        pass
+    events.clear(wipe_log=wipe)
+    return JSONResponse({"status": "cleared", "log_wiped": wipe})
+
+
+@app.get("/events/info")
+async def events_info() -> JSONResponse:
+    return JSONResponse({
+        "persisted": events.log_size(),
+        "in_memory": len(events.history()),
+        "file": events.EVENT_LOG,
+    })
 
 
 @app.get("/active-calls")
@@ -766,13 +1047,23 @@ async def handle_vobiz_websocket(
         else:
             print("[CALL] ⚠️  No call UUID found in URL query params")
 
+        # Wrap the socket so the dashboard can see the stream protocol. The tap
+        # only observes: every method delegates to the real WebSocket, and the
+        # transport and serializer behave exactly as before.
+        tapped = WebSocketTap(websocket, call_uuid=call_uuid)
+
         # Create runner arguments and run the bot
-        runner_args = WebSocketRunnerArguments(websocket=websocket)
+        runner_args = WebSocketRunnerArguments(websocket=tapped)
         runner_args.handle_sigint = False
 
         print("[DEBUG] Calling bot function...")
         # We pass call_id if we have it, but we let stream_id be None so bot/transport can find it from the stream
-        await bot(runner_args, call_id=call_uuid, stream_id=stream_id)
+        try:
+            await bot(runner_args, call_id=call_uuid, stream_id=stream_id)
+        finally:
+            # Emit whatever audio was counted but not yet rolled up, so the
+            # feed does not end mid-window.
+            tapped.flush()
 
         print("[DEBUG] Bot function completed")
 
@@ -845,4 +1136,5 @@ async def websocket_stream(
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    # Cloud Run and most PaaS hosts inject PORT; 7860 is the local default.
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "7860")))
