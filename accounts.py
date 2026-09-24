@@ -76,8 +76,13 @@ async def fetch_numbers(session: aiohttp.ClientSession, auth_id: str, token: str
                "Content-Type": "application/json"}
     async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
         body = await r.text()
-        if r.status == 401:
-            raise PermissionError("Vobiz rejected these credentials (401)")
+        if r.status in (401, 403):
+            raise PermissionError(
+                f"Vobiz rejected these credentials ({r.status}). Check the Auth ID "
+                "and Auth Token are from the same account and copied in full.")
+        if r.status == 404:
+            raise ValueError(
+                f"Vobiz does not recognise the Auth ID {auth_id!r} (404).")
         if r.status != 200:
             raise RuntimeError(f"Vobiz returned {r.status}: {body[:200]}")
         import json
@@ -99,9 +104,12 @@ async def connect(http: aiohttp.ClientSession, auth_id: str, token: str) -> tupl
 
     numbers = await fetch_numbers(http, auth_id, token)
     if not numbers:
-        raise RuntimeError(
-            "Credentials are valid but the account has no active voice-enabled "
-            "number to call from."
+        # ValueError, not RuntimeError: this is a problem with the account, not
+        # with reaching Vobiz, and the caller maps RuntimeError to "could not
+        # reach Vobiz" — which would send someone debugging their network.
+        raise ValueError(
+            f"Credentials for {auth_id} are valid, but the account has no active "
+            "voice-enabled number to call from. Buy or activate a number first."
         )
 
     _reap()

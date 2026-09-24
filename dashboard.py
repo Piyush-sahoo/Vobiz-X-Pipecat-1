@@ -311,8 +311,22 @@ DASHBOARD_HTML = r"""<!doctype html>
 </main>
 
 <script>
+// A single uncaught error used to kill the rest of this script silently: no
+// button handlers, no SSE, and nothing on screen to say why. Surface it in the
+// header instead of leaving a dead page.
+window.addEventListener('error', e => {
+  const c = document.getElementById('conn');
+  if (c) { c.textContent = 'script error — see console'; c.style.color = '#f85149'; }
+  console.error('[dashboard]', e.error || e.message);
+});
+
 const $ = id => document.getElementById(id);
 let type = 'pstn';
+// 'ours' = this server's Pipecat agent (default). 'theirs' = the customer's
+// WebSocket. Declared here, with the other UI state, because describeAgent()
+// reads it during init — declaring it further down put it in a temporal dead
+// zone and the ReferenceError killed the rest of the script.
+let agent = 'ours';
 let pending = null;      // call UUID to re-select after a refresh rebuilds the list
 let userPicked = false;  // once you choose a UUID, new calls stop stealing the selection
 const uuids = new Set();
@@ -350,10 +364,6 @@ document.querySelectorAll('.seg').forEach(group => {
 });
 describe();
 
-// L16 is the only encoding with a byte-order choice.
-$('enc').onchange = describeAgent;
-describeAgent();
-
 function flash(el, text, ok) {
   el.textContent = text;
   el.className = 'msg ' + (ok ? 'ok' : 'bad');
@@ -374,10 +384,6 @@ async function post(url, body) {
 // localStorage, so closing the tab drops it.
 let acctSession = null;
 
-// 'ours' = this server's Pipecat agent (default). 'theirs' = the customer's
-// WebSocket, which takes the media entirely out of this process.
-let agent = 'ours';
-
 function describeAgent() {
   const theirs = agent === 'theirs';
   $('extwrap').hidden = !theirs;
@@ -386,6 +392,12 @@ function describeAgent() {
     : "ICICI Lombard agent running on this server.";
   $('endianwrap').hidden = !(theirs && $('enc').value === 'audio/x-l16');
 }
+
+// L16 is the only encoding with a byte-order choice. Attached here, after the
+// definition and after `agent` exists — calling it earlier threw a temporal
+// dead zone ReferenceError that killed the whole script.
+$('enc').onchange = describeAgent;
+describeAgent();
 
 
 function setNumbers(numbers) {
@@ -417,7 +429,13 @@ $('connectbtn').onclick = async () => {
     $('acct-on').hidden = false;
     setNumbers(d.numbers);
     flash($('acctmsg'), 'Calls will be placed from your account.', true);
-  } catch (e) { flash($('acctmsg'), e.message, false); }
+  } catch (e) {
+    // The error div sits below a hidden block, so make sure it is actually
+    // seen rather than silently rendered off-screen.
+    flash($('acctmsg'), e.message, false);
+    $('acctmsg').scrollIntoView({block: 'nearest'});
+    console.error('[account/connect]', e);
+  }
   b.disabled = false;
 };
 
