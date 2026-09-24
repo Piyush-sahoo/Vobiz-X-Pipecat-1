@@ -210,6 +210,47 @@ DASHBOARD_HTML = r"""<!doctype html>
   </fieldset>
 
   <fieldset>
+    <legend>Voice agent</legend>
+    <div class="seg">
+      <button class="on" data-agent="ours">This agent</button>
+      <button data-agent="theirs">Customer's agent</button>
+    </div>
+    <p class="hint" id="agenthint">ICICI Lombard agent running on this server.</p>
+
+    <div id="extwrap" hidden>
+      <label for="wss">Customer's WebSocket URL</label>
+      <input id="wss" placeholder="wss://their-agent.example.com/ws">
+
+      <label for="enc">Encoding</label>
+      <select id="enc">
+        <option value="audio/x-mulaw">audio/x-mulaw (G.711u)</option>
+        <option value="audio/x-l16">audio/x-l16 (linear PCM)</option>
+      </select>
+
+      <label for="rate">Sample rate</label>
+      <select id="rate">
+        <option value="8000">8000 Hz</option>
+        <option value="16000">16000 Hz</option>
+        <option value="24000">24000 Hz — not in every region</option>
+      </select>
+
+      <div id="endianwrap" hidden>
+        <label for="endian">L16 byte order</label>
+        <select id="endian">
+          <option value="be">be — big-endian (RFC 2586)</option>
+          <option value="le">le — little-endian</option>
+        </select>
+        <p class="hint">If L16 frames arrive the right size but produce no
+          audio, flip this.</p>
+      </div>
+
+      <p class="hint">Vobiz streams the call to their server, so <b>their</b>
+        agent talks. The stream pane stays empty — this server never sees that
+        audio — but every HTTP webhook still lands here.</p>
+    </div>
+  </fieldset>
+
+  <fieldset>
     <legend>Escalate to human specialist</legend>
     <label>Which leg</label>
     <div class="seg">
@@ -303,10 +344,15 @@ document.querySelectorAll('.seg').forEach(group => {
     b.classList.add('on');
     if (b.dataset.type) type = b.dataset.type;
     if (b.dataset.legs) legs = b.dataset.legs;
+    if (b.dataset.agent) { agent = b.dataset.agent; describeAgent(); }
     describe();
   });
 });
 describe();
+
+// L16 is the only encoding with a byte-order choice.
+$('enc').onchange = describeAgent;
+describeAgent();
 
 function flash(el, text, ok) {
   el.textContent = text;
@@ -327,6 +373,20 @@ async function post(url, body) {
 // Session id for a connected account. Kept in memory only — deliberately not
 // localStorage, so closing the tab drops it.
 let acctSession = null;
+
+// 'ours' = this server's Pipecat agent (default). 'theirs' = the customer's
+// WebSocket, which takes the media entirely out of this process.
+let agent = 'ours';
+
+function describeAgent() {
+  const theirs = agent === 'theirs';
+  $('extwrap').hidden = !theirs;
+  $('agenthint').textContent = theirs
+    ? "Vobiz streams to the URL below. This server still handles the answer XML, transfers and webhooks."
+    : "ICICI Lombard agent running on this server.";
+  $('endianwrap').hidden = !(theirs && $('enc').value === 'audio/x-l16');
+}
+
 
 function setNumbers(numbers) {
   const sel = $('from');
@@ -376,8 +436,15 @@ $('callbtn').onclick = async () => {
     const body = {phone_number: $('num').value.trim()};
     if (acctSession) body.session = acctSession;
     if ($('from').value) body.from_number = $('from').value;
+    if (agent === 'theirs') {
+      body.stream_url  = $('wss').value.trim();
+      body.encoding    = $('enc').value;
+      body.sample_rate = $('rate').value;
+      if ($('enc').value === 'audio/x-l16') body.l16_endian = $('endian').value;
+    }
     const d = await post('/start', body);
-    flash($('callmsg'), 'Ringing — ' + d.call_uuid, true);
+    flash($('callmsg'), 'Ringing — ' + d.call_uuid
+      + (agent === 'theirs' ? '\nStreaming to the customer\'s agent.' : ''), true);
   } catch (e) { flash($('callmsg'), e.message, false); }
   b.disabled = false;
 };

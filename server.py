@@ -297,6 +297,62 @@ def get_host_and_protocol(request: Request = None):
         return host, protocol
 
 
+SUPPORTED_ENCODINGS = ("audio/x-mulaw", "audio/x-l16")
+SUPPORTED_RATES = (8000, 16000, 24000)
+
+
+def validate_stream_config(stream_url: str, encoding: str, sample_rate,
+                           l16_endian: str = None) -> dict:
+    """Validate a per-call stream destination and wire format.
+
+    Used when a customer supplies their OWN agent's WebSocket. Whatever is
+    returned here ends up in <Stream>, so a bad value would be discovered as
+    silence on a live call rather than as an error.
+    """
+    cfg = {}
+
+    if stream_url:
+        url = stream_url.strip()
+        # Vobiz dials out to this from the internet. ws:// is allowed only so a
+        # local mock can be tested; a real client endpoint must be wss://.
+        if not url.startswith(("wss://", "ws://")):
+            raise ValueError("Stream URL must start with wss:// (or ws:// for local testing)")
+        if url.startswith("ws://"):
+            print("[STREAM] WARNING: ws:// is unencrypted and will not work from "
+                  "Vobiz's network — local testing only")
+        cfg["stream_url"] = url
+
+    if encoding:
+        enc = encoding.strip()
+        if enc not in SUPPORTED_ENCODINGS:
+            raise ValueError(
+                f"Unsupported encoding {enc!r}. Use one of: {', '.join(SUPPORTED_ENCODINGS)}")
+        cfg["encoding"] = enc
+
+    if sample_rate:
+        try:
+            rate = int(sample_rate)
+        except (TypeError, ValueError):
+            raise ValueError(f"Sample rate must be a number, got {sample_rate!r}")
+        if rate not in SUPPORTED_RATES:
+            raise ValueError(
+                f"Unsupported sample rate {rate}. Use one of: "
+                f"{', '.join(str(r) for r in SUPPORTED_RATES)}")
+        # 24 kHz is accepted by the serializer but is not reliably available in
+        # every Vobiz region, so it is worth saying so rather than debugging it.
+        if rate == 24000:
+            print("[STREAM] WARNING: 24000 Hz is not reliably available in every region")
+        cfg["sample_rate"] = rate
+
+    if l16_endian:
+        end = l16_endian.strip().lower()
+        if end not in ("be", "le"):
+            raise ValueError("L16 byte order must be 'be' or 'le'")
+        cfg["l16_endian"] = end
+
+    return cfg
+
+
 def get_websocket_url(host: str):
     """Construct WebSocket URL for Vobiz Stream XML.
 
@@ -374,11 +430,26 @@ async def initiate_outbound_call(request: Request) -> JSONResponse:
         host, protocol = get_host_and_protocol(request)
 
         # Add body data as query parameters to answer URL
-        answer_url = f"{protocol}://{host}/answer"
+        # A customer can point the media stream at their OWN agent and declare
+        # the wire format it speaks. Validated here so a bad value fails now,
+        # not as silence on a live call.
+        try:
+            stream_cfg = validate_stream_config(
+                data.get("stream_url"), data.get("encoding"),
+                data.get("sample_rate"), data.get("l16_endian"))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # Ride on the answer URL so /answer stays correct even if active_calls
+        # has been lost, and so the XML is reproducible from the URL alone.
+        answer_params = dict(stream_cfg)
         if body_data:
-            body_json = json.dumps(body_data)
-            body_encoded = urllib.parse.quote(body_json)
-            answer_url = f"{answer_url}?body_data={body_encoded}"
+            answer_params["body_data"] = json.dumps(body_data)
+        answer_url = f"{protocol}://{host}/answer"
+        if answer_params:
+            answer_url = f"{answer_url}?{urllib.parse.urlencode(answer_params)}"
+        if stream_cfg.get("stream_url"):
+            print(f"[STREAM] External agent for this call: {stream_cfg['stream_url']}")
 
         print(f"[INFO] Answer URL that will be sent to Vobiz: {answer_url}")
 
@@ -449,6 +520,8 @@ async def initiate_outbound_call(request: Request) -> JSONResponse:
                     "session": session_id,
                     "auth_id": acct_id,
                     "from_number": from_number,
+                    # Empty when this call uses our own agent.
+                    "stream": stream_cfg,
                 }
                 print(f"[CALL] Pre-registered call {call_uuid} in active_calls")
 
@@ -548,15 +621,24 @@ async def get_answer_xml(
         # This ensures we use PUBLIC_URL if configured
         host, protocol = get_host_and_protocol(request)
 
-        # Get base WebSocket URL (Vobiz uses wss:// protocol)
-        base_ws_url = get_websocket_url(host)
+        # Default is this server's own agent. A stream_url on the answer URL
+        # points the media at the customer's agent instead — their bot, our
+        # telephony. Everything else in the XML is unchanged.
+        external_ws = request.query_params.get("stream_url")
+        if external_ws:
+            base_ws_url = external_ws
+            print(f"[STREAM] Using customer's agent: {external_ws}")
+        else:
+            base_ws_url = get_websocket_url(host)
 
         # Add query parameters to WebSocket URL
         query_params = []
 
-        # Add serviceHost for production
+        # Add serviceHost for production. Skipped for a customer's own agent:
+        # serviceHost is a Pipecat Cloud convention and appending it to someone
+        # else's URL would hand them a query param they never asked for.
         env = os.getenv("ENV", "local").lower()
-        if env == "production":
+        if env == "production" and not external_ws:
             agent_name = os.getenv("AGENT_NAME")
             org_name = os.getenv("ORGANIZATION_NAME")
             service_host = f"{agent_name}.{org_name}"
@@ -599,8 +681,12 @@ async def get_answer_xml(
         # separator as &amp; so the <Stream> body stays well-formed XML.
         final_ws_url = ws_url
 
-        vobiz_encoding = os.getenv("VOBIZ_ENCODING", "audio/x-mulaw")
-        vobiz_rate = int(os.getenv("VOBIZ_SAMPLE_RATE", "8000"))
+        # Per-call format wins over the env default, because the customer's
+        # agent may only speak one encoding and rate.
+        vobiz_encoding = (request.query_params.get("encoding")
+                          or os.getenv("VOBIZ_ENCODING", "audio/x-mulaw"))
+        vobiz_rate = int(request.query_params.get("sample_rate")
+                         or os.getenv("VOBIZ_SAMPLE_RATE", "8000"))
         vobiz_content_type = f"{vobiz_encoding};rate={vobiz_rate}"
         print(f"[INFO] Vobiz wire format: {vobiz_content_type}")
 
