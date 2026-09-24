@@ -105,7 +105,7 @@ def validate_sip_headers(raw: str):
 
 
 def build_transfer_xml(dest_type: str, destination: str, host: str, protocol: str,
-                       sip_headers: str = None) -> str:
+                       sip_headers: str = None, caller_id: str = None) -> str:
     """Build the <Dial> document that bridges a live call to a human.
 
     Two destination types, and the element inside <Dial> is what differs:
@@ -129,8 +129,13 @@ def build_transfer_xml(dest_type: str, destination: str, host: str, protocol: st
     else:
         inner = f"<Number>{escape(destination)}</Number>"
 
-    caller_id = os.getenv("VOBIZ_PHONE_NUMBER", "")
-    caller_attr = f' callerId="{caller_id}"' if caller_id else ""
+    # callerId MUST be a number the account placing the call owns. Falling back
+    # to VOBIZ_PHONE_NUMBER is only right when the server's own account placed
+    # the call — with a connected account that env number belongs to a DIFFERENT
+    # account, Vobiz rejects the <Dial>, and the only symptom is
+    # DialStatus=failed with HangupCause "Invalid Action XML".
+    caller_id = caller_id or os.getenv("VOBIZ_PHONE_NUMBER", "")
+    caller_attr = f' callerId="{escape(caller_id, quote=True)}"' if caller_id else ""
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -515,7 +520,8 @@ async def get_answer_xml(
             host, protocol = get_host_and_protocol(request)
             xml_content = build_transfer_xml(
                 dest_type, destination, host, protocol,
-                call_info.get("transfer_sip_headers", ""))
+                call_info.get("transfer_sip_headers", ""),
+                caller_id=call_info.get("from_number") or "")
             events.record_xml(f"XML -> Vobiz: <Dial> transfer ({dest_type})",
                               xml_content, call_uuid=CallUUID)
 
@@ -760,8 +766,15 @@ async def transfer_to_human(request: Request) -> HTMLResponse:
     sip_headers = (request.query_params.get("sip_headers")
                    or call_info.get("transfer_sip_headers") or "")
 
+    # The A-leg's own from_number is the only callerId guaranteed to be owned by
+    # the account that placed this call. Query param first so the redirect stays
+    # self-describing if active_calls has been lost.
+    caller_id = (request.query_params.get("caller_id")
+                 or call_info.get("from_number") or "")
+
     host, protocol = get_host_and_protocol(request)
-    xml_content = build_transfer_xml(dest_type, destination, host, protocol, sip_headers)
+    xml_content = build_transfer_xml(dest_type, destination, host, protocol,
+                                     sip_headers, caller_id=caller_id)
     events.record_xml(f"XML -> Vobiz: <Dial> transfer ({dest_type})",
                       xml_content, call_uuid=call_uuid)
 
@@ -847,6 +860,8 @@ async def initiate_transfer(request: Request) -> JSONResponse:
     params = {"type": dest_type, "destination": destination}
     if sip_headers:
         params["sip_headers"] = sip_headers
+    if call_info.get("from_number"):
+        params["caller_id"] = call_info["from_number"]
     transfer_url = f"{base}/transfer-to-human?{urllib.parse.urlencode(params)}"
 
     print(f"[TRANSFER] Call UUID: {call_uuid}")

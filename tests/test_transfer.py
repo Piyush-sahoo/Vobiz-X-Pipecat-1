@@ -76,5 +76,26 @@ class SipHeaderRules(unittest.TestCase):
         self.assertTrue(warnings)
 
 
+
+class CallerIdOwnership(unittest.TestCase):
+    """callerId must belong to the account that placed the call.
+
+    Regression test: with a connected account, falling back to the server's
+    VOBIZ_PHONE_NUMBER puts a number from a DIFFERENT account in callerId.
+    Vobiz rejects the <Dial> and the only symptom is DialStatus=failed with
+    HangupCause "Invalid Action XML".
+    """
+
+    def test_supplied_caller_id_wins_over_env(self):
+        xml = server.build_transfer_xml("sip", "a@b.c", "h.dev", "https",
+                                        caller_id="+918065354911")
+        self.assertIn('callerId="+918065354911"', xml)
+        self.assertNotIn(os.environ.get("VOBIZ_PHONE_NUMBER", "\x00sentinel"), xml)
+
+    def test_falls_back_to_env_when_absent(self):
+        os.environ["VOBIZ_PHONE_NUMBER"] = "+917965853984"
+        xml = server.build_transfer_xml("pstn", "+910000000000", "h.dev", "https")
+        self.assertIn('callerId="+917965853984"', xml)
+
 if __name__ == "__main__":
     unittest.main()
