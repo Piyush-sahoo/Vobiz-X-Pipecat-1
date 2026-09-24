@@ -18,13 +18,18 @@ DASHBOARD_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vobiz × Pipecat — Webhook Inspector</title>
+<title>ICICI Lombard × Vobiz — AI Customer Support</title>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --line: #30363d;
     --text: #e6edf3; --dim: #8b949e;
     --out: #58a6ff; --in: #3fb950; --xml: #d29922; --err: #f85149; --stream: #bc8cff;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+
+    /* Brand accent, shared by both marks. Kept separate from the event
+       colours above, which encode direction and must stay distinguishable. */
+    --brand: #ee4000;
+    --brand-ink: #fff3ee;
   }
   * { box-sizing: border-box; }
   /* Full-height app shell: the page itself never scrolls. Header and sidebar
@@ -33,10 +38,22 @@ DASHBOARD_HTML = r"""<!doctype html>
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 15px/1.5 system-ui, -apple-system, sans-serif;
          display: flex; flex-direction: column; overflow: hidden; }
-  header { padding: 14px 20px; border-bottom: 1px solid var(--line);
+  header { padding: 12px 20px; border-bottom: 1px solid var(--line);
            display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-           background: var(--panel); flex: 0 0 auto; }
-  h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+           background: var(--panel); flex: 0 0 auto;
+           box-shadow: inset 0 2px 0 var(--brand); }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+
+  /* Both marks sit on the dark chrome. The Vobiz mark is dark-on-transparent,
+     so it gets a light plate; the ICICI Lombard mark is already reversed. */
+  .brands { display: flex; align-items: center; gap: 12px; }
+  .brands img { display: block; }
+  .brands .icici { height: 22px; }
+  .brands .vobiz { height: 20px; }
+  .plate { background: #fff; border-radius: 5px; padding: 5px 9px; display: flex; }
+  .cross { color: var(--dim); font-size: 15px; font-weight: 300; }
+  .tagline { font-size: 12px; color: var(--dim); border-left: 1px solid var(--line);
+             padding-left: 14px; }
   .status { font-size: 13px; color: var(--dim); display: flex; align-items: center; gap: 7px; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--err); }
   .dot.live { background: var(--in); box-shadow: 0 0 8px var(--in); }
@@ -56,8 +73,8 @@ DASHBOARD_HTML = r"""<!doctype html>
   input, select, button { width: 100%; padding: 9px 11px; border-radius: 6px;
     border: 1px solid var(--line); background: var(--bg); color: var(--text);
     font-size: 14px; font-family: inherit; }
-  input:focus, select:focus { outline: 2px solid var(--out); outline-offset: -1px; }
-  button { background: var(--out); color: #04131f; border: none; font-weight: 600;
+  input:focus, select:focus { outline: 2px solid var(--brand); outline-offset: -1px; }
+  button { background: var(--brand); color: var(--brand-ink); border: none; font-weight: 600;
            cursor: pointer; margin-top: 12px; }
   button:hover { filter: brightness(1.12); }
   button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line);
@@ -70,8 +87,11 @@ DASHBOARD_HTML = r"""<!doctype html>
                 border: 1px solid var(--line); font-weight: 500; }
   .seg button:first-child { border-radius: 6px 0 0 6px; }
   .seg button:last-child { border-radius: 0 6px 6px 0; border-left: none; }
-  .seg button.on { background: var(--out); color: #04131f; border-color: var(--out); }
+  .seg button.on { background: var(--brand); color: var(--brand-ink); border-color: var(--brand); }
   .hint { font-size: 12px; color: var(--dim); margin-top: 8px; line-height: 1.45; }
+  .connected { font-size: 13px; margin: 2px 0 0; }
+  .connected b { font-family: var(--mono); color: var(--brand); }
+  .connected span { color: var(--dim); font-size: 12px; }
   .msg { font-size: 12px; margin-top: 10px; padding: 8px 10px; border-radius: 6px;
          display: none; white-space: pre-wrap; word-break: break-word; }
   .msg.ok { display: block; background: #0f2f1a; color: var(--in); }
@@ -147,24 +167,50 @@ DASHBOARD_HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>Vobiz × Pipecat — Webhook Inspector</h1>
-  <div class="status">APP = this Pipecat server</div>
+  <div class="brands">
+    <img class="icici" src="/static/icici-lombard-logo.png" alt="ICICI Lombard">
+    <span class="cross">×</span>
+    <span class="plate"><img class="vobiz" src="/static/vobiz-logo.png" alt="Vobiz"></span>
+  </div>
+  <div class="tagline">AI Customer Support — live call inspector</div>
   <div class="status"><span class="dot" id="dot"></span><span id="conn">connecting…</span></div>
+  <div class="status">APP = Vobiz voice backend</div>
   <div class="status" id="persist"></div>
 </header>
 
 <main>
 <aside>
   <fieldset>
-    <legend>Place a call</legend>
-    <label for="num">Destination number</label>
+    <legend>Your Vobiz account</legend>
+    <div id="acct-form">
+      <label for="aid">Auth ID</label>
+      <input id="aid" placeholder="MA_XXXXXXXX" autocomplete="off">
+      <label for="atok">Auth Token</label>
+      <input id="atok" type="password" placeholder="••••••••" autocomplete="off">
+      <button id="connectbtn">Connect account</button>
+      <p class="hint">Held in memory for this session only — never stored on
+        disk, never shown in the event feed.</p>
+    </div>
+    <div id="acct-on" hidden>
+      <p class="connected">Connected <b id="acct-id"></b>
+        <span id="acct-n"></span></p>
+      <button class="ghost" id="disconnectbtn">Disconnect</button>
+    </div>
+    <div class="msg" id="acctmsg"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Place a customer call</legend>
+    <label for="from" id="fromlabel">From (your number)</label>
+    <select id="from"><option value="">server default</option></select>
+    <label for="num">Customer number</label>
     <input id="num" placeholder="+91… (E.164)">
     <button id="callbtn">Call</button>
     <div class="msg" id="callmsg"></div>
   </fieldset>
 
   <fieldset>
-    <legend>Transfer live call</legend>
+    <legend>Escalate to human specialist</legend>
     <label>Which leg</label>
     <div class="seg">
       <button class="on" data-legs="aleg">A-leg</button>
@@ -278,10 +324,59 @@ async function post(url, body) {
   return d;
 }
 
+// Session id for a connected account. Kept in memory only — deliberately not
+// localStorage, so closing the tab drops it.
+let acctSession = null;
+
+function setNumbers(numbers) {
+  const sel = $('from');
+  sel.innerHTML = '';
+  if (!numbers) {
+    sel.innerHTML = '<option value="">server default</option>';
+    return;
+  }
+  numbers.forEach(n => {
+    const o = document.createElement('option');
+    o.value = n.e164;
+    o.textContent = n.e164 + (n.country ? '  ·  ' + n.country : '');
+    sel.appendChild(o);
+  });
+}
+
+$('connectbtn').onclick = async () => {
+  const b = $('connectbtn'); b.disabled = true;
+  try {
+    const d = await post('/account/connect', {
+      auth_id: $('aid').value.trim(), auth_token: $('atok').value.trim()
+    });
+    acctSession = d.session;
+    $('atok').value = '';                 // do not leave the token in the DOM
+    $('acct-id').textContent = d.auth_id;
+    $('acct-n').textContent = '· ' + d.numbers.length + ' numbers';
+    $('acct-form').hidden = true;
+    $('acct-on').hidden = false;
+    setNumbers(d.numbers);
+    flash($('acctmsg'), 'Calls will be placed from your account.', true);
+  } catch (e) { flash($('acctmsg'), e.message, false); }
+  b.disabled = false;
+};
+
+$('disconnectbtn').onclick = async () => {
+  try { await post('/account/disconnect', {session: acctSession}); } catch {}
+  acctSession = null;
+  $('acct-form').hidden = false;
+  $('acct-on').hidden = true;
+  setNumbers(null);
+  flash($('acctmsg'), 'Disconnected — back to the server account.', true);
+};
+
 $('callbtn').onclick = async () => {
   const b = $('callbtn'); b.disabled = true;
   try {
-    const d = await post('/start', {phone_number: $('num').value.trim()});
+    const body = {phone_number: $('num').value.trim()};
+    if (acctSession) body.session = acctSession;
+    if ($('from').value) body.from_number = $('from').value;
+    const d = await post('/start', body);
     flash($('callmsg'), 'Ringing — ' + d.call_uuid, true);
   } catch (e) { flash($('callmsg'), e.message, false); }
   b.disabled = false;

@@ -19,8 +19,11 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse, HTMLResponse, JSONResponse, StreamingResponse,
+)
 
+import accounts
 import events
 from dashboard import DASHBOARD_HTML
 from ws_tap import WebSocketTap
@@ -144,13 +147,17 @@ def build_transfer_xml(dest_type: str, destination: str, host: str, protocol: st
 
 async def make_vobiz_call(
     session: aiohttp.ClientSession, to_number: str, from_number: str, answer_url: str,
-    hangup_url: str = None
+    hangup_url: str = None, auth_id: str = None, auth_token: str = None
 ):
-    """Make an outbound call using Vobiz's REST API."""
+    """Make an outbound call using Vobiz's REST API.
+
+    auth_id/auth_token override the server's own account, so a caller who
+    connected their credentials in the dashboard dials from their own account.
+    """
     print("\n[DEBUG] ========== VOBIZ API CALL START ==========")
 
-    auth_id = os.getenv("VOBIZ_AUTH_ID")
-    auth_token = os.getenv("VOBIZ_AUTH_TOKEN")
+    auth_id = auth_id or os.getenv("VOBIZ_AUTH_ID")
+    auth_token = auth_token or os.getenv("VOBIZ_AUTH_TOKEN")
 
     if not auth_id:
         raise ValueError("Missing Vobiz Auth ID (VOBIZ_AUTH_ID)")
@@ -187,7 +194,9 @@ async def make_vobiz_call(
                   kind="rest", note=f"dial {to_number} from {from_number}")
 
     print(f"[DEBUG] API URL: {url}")
-    print(f"[DEBUG] Request Headers: {headers}")
+    # Never print `headers` — it carries X-Auth-Token. With connected accounts
+    # that would put someone else's credentials in this server's log.
+    print(f"[DEBUG] Request Headers: {{'X-Auth-ID': {auth_id!r}, 'X-Auth-Token': '<redacted>'}}")
     print(f"[DEBUG] Request Body: {json.dumps(data, indent=2)}")
     print(f"[DEBUG] Answer URL being sent: {answer_url}")
 
@@ -368,8 +377,34 @@ async def initiate_outbound_call(request: Request) -> JSONResponse:
 
         print(f"[INFO] Answer URL that will be sent to Vobiz: {answer_url}")
 
-        # Get the from number (optional - can be provided in request body)
-        from_number = data.get("from_number") or os.getenv("VOBIZ_PHONE_NUMBER")
+        # Resolve which Vobiz account places this call. A connected session
+        # wins; otherwise the server's own .env account.
+        session_id = data.get("session")
+        try:
+            acct_id, acct_token, source = accounts.credentials(
+                session_id, os.getenv("VOBIZ_AUTH_ID"), os.getenv("VOBIZ_AUTH_TOKEN"))
+        except accounts.SessionExpired as e:
+            raise HTTPException(status_code=401, detail=str(e))
+        account = accounts.get(session_id)
+        print(f"[DEBUG] Using {source} credentials (auth_id={acct_id})")
+
+        # Get the from number. With a connected account it must be one that
+        # account actually owns — Vobiz rejects a `from` it does not own, and
+        # the error is easy to misread as a credential problem.
+        from_number = data.get("from_number")
+        if account:
+            owned = {n["e164"] for n in account.numbers}
+            if not from_number:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Choose a from_number from your connected account")
+            if from_number not in owned:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{from_number} is not owned by account {acct_id}. "
+                           f"Owned: {', '.join(sorted(owned))}")
+        else:
+            from_number = from_number or os.getenv("VOBIZ_PHONE_NUMBER")
         print(f"[DEBUG] From number: {from_number}")
 
         if not from_number:
@@ -388,6 +423,8 @@ async def initiate_outbound_call(request: Request) -> JSONResponse:
                 from_number=from_number,
                 answer_url=answer_url,
                 hangup_url=f"{protocol}://{host}/hangup",
+                auth_id=acct_id,
+                auth_token=acct_token,
             )
 
             # Extract call UUID from Vobiz response
@@ -401,7 +438,12 @@ async def initiate_outbound_call(request: Request) -> JSONResponse:
                     "status": "initiated",
                     "started_at": datetime.now().isoformat(),
                     "transfer_requested": False,
-                    "websocket": None
+                    "websocket": None,
+                    # Which account owns this call. Transfers and the bot's
+                    # REST hangup must use the same credentials that placed it.
+                    "session": session_id,
+                    "auth_id": acct_id,
+                    "from_number": from_number,
                 }
                 print(f"[CALL] Pre-registered call {call_uuid} in active_calls")
 
@@ -784,9 +826,15 @@ async def initiate_transfer(request: Request) -> JSONResponse:
         print(f"[TRANSFER] sipHeaders: {sip_headers}")
     print(f"[TRANSFER] Marked call {call_uuid} as transferring")
 
-    # Get Vobiz credentials
-    auth_id = os.getenv("VOBIZ_AUTH_ID")
-    auth_token = os.getenv("VOBIZ_AUTH_TOKEN")
+    # Transfer with whichever account placed the call, not necessarily the
+    # server's own. Vobiz scopes the call UUID to the account that owns it.
+    try:
+        auth_id, auth_token, cred_source = accounts.credentials(
+            call_info.get("session"), os.getenv("VOBIZ_AUTH_ID"),
+            os.getenv("VOBIZ_AUTH_TOKEN"))
+    except accounts.SessionExpired as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    print(f"[TRANSFER] Using {cred_source} credentials (auth_id={auth_id})")
 
     # Get PUBLIC_URL for transfer endpoint
     public_url = os.getenv("PUBLIC_URL")
@@ -915,6 +963,17 @@ async def dashboard() -> HTMLResponse:
     return HTMLResponse(content=DASHBOARD_HTML)
 
 
+@app.get("/static/{filename}")
+async def static_file(filename: str) -> FileResponse:
+    """Serve brand assets. Path is constrained to the static dir by name only,
+    so a traversal like ../../.env cannot escape it."""
+    safe = os.path.basename(filename)
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", safe)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(path, headers={"Cache-Control": "public, max-age=3600"})
+
+
 @app.get("/events")
 async def events_stream(request: Request) -> StreamingResponse:
     """Server-sent events: history, then live."""
@@ -945,6 +1004,51 @@ async def events_info() -> JSONResponse:
         "in_memory": len(events.history()),
         "file": events.EVENT_LOG,
     })
+
+
+@app.post("/account/connect")
+async def account_connect(request: Request) -> JSONResponse:
+    """Connect a Vobiz account so calls are placed from the caller's own numbers.
+
+    The token is validated against Vobiz, held in memory only, and never
+    returned, logged, or written to the event feed.
+    """
+    data = await request.json()
+    try:
+        session_id, account = await accounts.connect(
+            request.app.state.session, data.get("auth_id"), data.get("auth_token"))
+    except PermissionError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach Vobiz: {e}")
+
+    # Deliberately no token in this log line or in the event feed.
+    print(f"[ACCOUNT] Connected {account.auth_id} — {len(account.numbers)} numbers")
+    events.record("out", "GET /Account/{id}/numbers", {"auth_id": account.auth_id},
+                  kind="rest", note=f"connected — {len(account.numbers)} numbers")
+
+    return JSONResponse({
+        "session": session_id,
+        "auth_id": account.auth_id,
+        "numbers": account.numbers,
+    })
+
+
+@app.post("/account/disconnect")
+async def account_disconnect(request: Request) -> JSONResponse:
+    data = await request.json()
+    removed = accounts.disconnect(data.get("session"))
+    return JSONResponse({"status": "disconnected" if removed else "unknown_session"})
+
+
+@app.get("/account/numbers")
+async def account_numbers(session: str = Query(None)) -> JSONResponse:
+    account = accounts.get(session)
+    if not account:
+        raise HTTPException(status_code=404, detail="No connected account for that session")
+    return JSONResponse({"auth_id": account.auth_id, "numbers": account.numbers})
 
 
 @app.get("/active-calls")
@@ -1058,8 +1162,24 @@ async def handle_vobiz_websocket(
 
         print("[DEBUG] Calling bot function...")
         # We pass call_id if we have it, but we let stream_id be None so bot/transport can find it from the stream
+        # The serializer hangs up over REST, so the bot needs the credentials of
+        # whichever account placed this call.
         try:
-            await bot(runner_args, call_id=call_uuid, stream_id=stream_id)
+            ws_auth_id, ws_auth_token, _ = accounts.credentials(
+                active_calls.get(call_uuid, {}).get("session"),
+                os.getenv("VOBIZ_AUTH_ID"), os.getenv("VOBIZ_AUTH_TOKEN"))
+        except accounts.SessionExpired:
+            # The call is already live; refusing here would drop it mid-stream.
+            # Fall back so the media keeps flowing, but make the REST hang-up
+            # mismatch obvious in the log.
+            print("[WARN] session expired mid-call — REST hang-up will use the "
+                  "server account, which may not own this call")
+            ws_auth_id = os.getenv("VOBIZ_AUTH_ID")
+            ws_auth_token = os.getenv("VOBIZ_AUTH_TOKEN")
+
+        try:
+            await bot(runner_args, call_id=call_uuid, stream_id=stream_id,
+                      auth_id=ws_auth_id, auth_token=ws_auth_token)
         finally:
             # Emit whatever audio was counted but not yet rolled up, so the
             # feed does not end mid-window.

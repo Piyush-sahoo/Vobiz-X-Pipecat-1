@@ -58,16 +58,60 @@ BOT_MODE = os.getenv("BOT_MODE", "cascaded").strip().lower()
 # Vobiz is 8 kHz mu-law on the wire. Keep the whole pipeline there.
 TELEPHONY_RATE = 8000
 
-SYSTEM_PROMPT = (
-    "You are a friendly assistant on a live phone call. "
-    "Your responses are spoken aloud, so keep them short and conversational. "
-    "Never use special characters, markdown, or formatting. "
-    "Keep answers to one or two sentences unless asked for more."
+# --- ICICI Lombard customer support persona -------------------------------
+#
+# Tuned for a spoken phone call, not a chat window. Three things matter:
+#   - short turns, because the caller cannot skim speech
+#   - no markdown or symbols, because TTS reads them aloud
+#   - a clear escalation path, because the demo ends in a live transfer
+#
+# Override any of this with AGENT_* env vars without touching code.
+
+BRAND = os.getenv("AGENT_BRAND", "ICICI Lombard")
+AGENT_NAME_SPOKEN = os.getenv("AGENT_NAME_SPOKEN", "Riya")
+
+SYSTEM_PROMPT = os.getenv("AGENT_SYSTEM_PROMPT") or (
+    f"You are {AGENT_NAME_SPOKEN}, an AI voice assistant for {BRAND} general "
+    "insurance customer support. You are on a live phone call.\n\n"
+
+    "HOW YOU SPEAK\n"
+    "Your words are spoken aloud by a text to speech engine. Keep every reply to "
+    "one or two short sentences. Never use markdown, bullet points, asterisks, "
+    "emoji or special characters. Say rupee amounts and policy numbers as words a "
+    "person would say them. Use plain Indian English, warm and efficient. Do not "
+    "monologue: ask one question at a time and wait.\n\n"
+
+    "WHAT YOU HELP WITH\n"
+    "Motor, health, travel and home insurance. Typical reasons people call: "
+    "checking or renewing a policy, asking about premium and due dates, "
+    "registering a motor or health claim, checking the status of an existing "
+    "claim, cashless hospitalisation and network hospitals, roadside assistance, "
+    "and requesting policy documents.\n\n"
+
+    "HOW YOU HANDLE A CALL\n"
+    "Identify the reason for the call first. Ask for the policy number when it is "
+    "needed, and read it back to confirm. If the caller gives a claim number, "
+    "confirm it the same way. Acknowledge the situation before moving to process, "
+    "especially on an accident or hospitalisation.\n\n"
+
+    "HONESTY RULES, THESE MATTER\n"
+    f"You are an AI assistant, not a human. Say so plainly if asked. You do not "
+    "have live access to policy records in this demo, so never invent a premium "
+    "amount, a claim status, a due date or a policy detail. If you do not have "
+    "something, say you will connect the caller to a specialist who can see their "
+    "records. Never promise a settlement, an amount, or a timeline.\n\n"
+
+    "ESCALATION\n"
+    "Offer to transfer to a human specialist when the caller asks for a person, "
+    "is distressed, is reporting an accident or hospitalisation, disputes "
+    "something, or needs a record you cannot see. Say clearly that you are "
+    "connecting them and that they should stay on the line."
 )
 
-GREETING_SEED = (
-    "Greet the caller: say you are the Vobiz AI assistant calling to test "
-    "the integration, then ask how they are doing."
+GREETING_SEED = os.getenv("AGENT_GREETING") or (
+    f"Greet the caller warmly. Say: Thank you for calling {BRAND}, this is "
+    f"{AGENT_NAME_SPOKEN}, an AI assistant. Then ask how you can help them today. "
+    "Keep it to two short sentences and then stop and listen."
 )
 
 
@@ -205,7 +249,8 @@ async def run_bot(transport: BaseTransport, handle_sigint: bool):
     await runner.run(task)
 
 
-async def bot(runner_args: RunnerArguments, call_id: str = None, stream_id: str = None):
+async def bot(runner_args: RunnerArguments, call_id: str = None, stream_id: str = None,
+              auth_id: str = None, auth_token: str = None):
     """Main bot entry point — identical Vobiz handshake in both modes."""
     env_encoding = os.getenv("VOBIZ_ENCODING", "audio/x-mulaw")
     env_sample_rate = int(os.getenv("VOBIZ_SAMPLE_RATE", str(TELEPHONY_RATE)))
@@ -225,8 +270,10 @@ async def bot(runner_args: RunnerArguments, call_id: str = None, stream_id: str 
     serializer = VobizFrameSerializer(
         stream_id=stream_id,
         call_id=call_id,
-        auth_id=os.getenv("VOBIZ_AUTH_ID", ""),
-        auth_token=os.getenv("VOBIZ_AUTH_TOKEN", ""),
+        # These are used for the serializer's REST hang-up, so they must be the
+        # account that placed the call — not necessarily the server's own.
+        auth_id=auth_id or os.getenv("VOBIZ_AUTH_ID", ""),
+        auth_token=auth_token or os.getenv("VOBIZ_AUTH_TOKEN", ""),
         params=VobizFrameSerializer.InputParams(
             vobiz_sample_rate=vobiz_sample_rate,
             encoding=vobiz_encoding,
